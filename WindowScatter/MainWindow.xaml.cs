@@ -2,13 +2,10 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
-using System.Windows.Media;
-using System.Windows.Media.Effects;
 using System.Windows.Threading;
 using static WindowScatter.Win32Interop;
 
@@ -16,26 +13,25 @@ namespace WindowScatter
 {
     public partial class MainWindow : Window
     {
-        // Constants
-        private const double ANIMATION_DURATION = 0.25;
-        private const int MAX_WINDOWS = 20;
-        private const double DWM_UPDATE_MIN_MS = 1.0;
-        private const double TARGET_BLUR_RADIUS = 40;
+        private WindowAnimationManager animationManager = null!;
+        private ThumbnailManager thumbnailManager = null!;
+        private WindowEnumerator windowEnumerator = null!;
+        private WindowSwitcher? windowSwitcher;
+        private WallpaperManager wallpaperManager = null!;
+        private HotCornerManager hotCornerManager = null!;
+        private DesktopCaptureManager desktopCaptureManager = null!;
+        private bool useDesktopCapture = true;
 
-        // Core state
         private List<WindowThumb> windowThumbs = new List<WindowThumb>();
-        private List<WindowLayout> cachedLayouts = null;
-        private List<IntPtr> lastWindowHandles = null;
+        private List<WindowLayout>? cachedLayouts;
+        private List<IntPtr>? lastWindowHandles;
+        private IntPtr selectedWindowHandle = IntPtr.Zero;
         private Random rng = new Random();
-        private DWM_THUMBNAIL_PROPERTIES sharedProps;
 
-        // Animation state
-        private DateTime animStart;
-        private DateTime lastDwmUpdate = DateTime.MinValue;
-        private double currentBlurRadius = 0;
-        private bool isReturningToOriginal = false;
+        private bool isScatterActive = false;
+        private bool isTransitioning = false;
+        private object transitionLock = new object();
 
-        // Hotkey state
         private IntPtr hookID = IntPtr.Zero;
         private LowLevelKeyboardProc hookCallback;
         private HotkeyParser configuredHotkey;
@@ -46,24 +42,16 @@ namespace WindowScatter
         private bool suppressStartMenu = false;
         private DateTime startMenuSuppressionStart;
 
-        // Wallpaper state
-        private HwndSource hwndSource;
-        private System.Windows.Threading.DispatcherTimer wallpaperCheckTimer;
-        private string lastWallpaperPath = null;
-        private WallpaperManager wallpaperManager;
+        private HwndSource? hwndSource;
+        private DispatcherTimer? wallpaperCheckTimer;
+        private string? lastWallpaperPath;
 
-        private bool isScatterActive = false;
-        private bool isAnimatingBack = false;
+        private DateTime lastActivationTime = DateTime.MinValue;
+        private const double IDLE_THRESHOLD_SECONDS = 2.0;
 
-        // NEW: Prevent click spam during transitions
-        private bool isTransitioning = false;
-        private object transitionLock = new object();
+        private DispatcherTimer thumbnailKeepAliveTimer;
 
-        // Settings
         private AppSettings settings;
-
-        // Hot Corners
-        private HotCornerManager hotCornerManager;
 
         public MainWindow()
         {
@@ -77,56 +65,70 @@ namespace WindowScatter
             this.Focusable = true;
             this.WindowStyle = WindowStyle.None;
             this.ResizeMode = ResizeMode.NoResize;
-            this.WindowState = WindowState.Maximized;
             this.AllowsTransparency = false;
 
-            sharedProps = new DWM_THUMBNAIL_PROPERTIES
-            {
-                dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE,
-                fVisible = true,
-                fSourceClientAreaOnly = true
-            };
+            this.Width = SystemParameters.PrimaryScreenWidth;
+            this.Height = SystemParameters.PrimaryScreenHeight - 1;
+            this.Left = 0;
+            this.Top = 0;
 
+            desktopCaptureManager = new DesktopCaptureManager(BackgroundImage, this);
             wallpaperManager = new WallpaperManager(BackgroundImage, this);
-            wallpaperManager.SetWallpaperBackground();
-            SetupWallpaperMonitoring();
 
-            this.Loaded += (s, e) =>
-            {
-                var helper = new WindowInteropHelper(this);
-                helper.EnsureHandle();
-                this.Visibility = Visibility.Hidden;
-            };
+            this.Loaded += OnWindowLoaded;
 
             hookCallback = HookCallback;
             hookID = SetHook(hookCallback);
 
-            // NEW: Initialize hot corners
             hotCornerManager = new HotCornerManager(settings, async () =>
             {
                 await Dispatcher.InvokeAsync(async () =>
                 {
-                    if (this.Visibility == Visibility.Hidden && !isScatterActive && !isAnimatingBack && !isTransitioning)
+                    if (CanActivateScatter())
                     {
                         await StartScatterAsync();
-                        this.Visibility = Visibility.Visible;
-                        this.Activate();
-                        this.Focus();
                     }
                 });
             });
             hotCornerManager.Start();
+
+            thumbnailKeepAliveTimer = new DispatcherTimer();
+            thumbnailKeepAliveTimer.Interval = TimeSpan.FromSeconds(1);
+            thumbnailKeepAliveTimer.Tick += ThumbnailKeepAlive_Tick;
         }
+
+        #region Initialization
+
+        private void OnWindowLoaded(object? sender, RoutedEventArgs e)
+        {
+            var helper = new WindowInteropHelper(this);
+            helper.EnsureHandle();
+
+            animationManager = new WindowAnimationManager(BackgroundImage, BlurOverlay, windowThumbs);
+            animationManager.SetDesktopCaptureManager(desktopCaptureManager);
+            thumbnailManager = new ThumbnailManager(ScatterCanvas, windowThumbs, helper.Handle, OnWindowClicked, OnWindowHovered);
+            windowEnumerator = new WindowEnumerator(helper.Handle);
+
+            if (!useDesktopCapture)
+            {
+                wallpaperManager.SetWallpaperBackground();
+                SetupWallpaperMonitoring();
+            }
+
+            this.Visibility = Visibility.Hidden;
+        }
+
+        #endregion
 
         #region Wallpaper Monitoring
 
         private void SetupWallpaperMonitoring()
         {
-            wallpaperCheckTimer = new System.Windows.Threading.DispatcherTimer();
+            wallpaperCheckTimer = new DispatcherTimer();
             wallpaperCheckTimer.Interval = TimeSpan.FromSeconds(2);
             wallpaperCheckTimer.Tick += (s, e) =>
             {
-                string currentPath = wallpaperManager.GetWallpaperPath();
+                string? currentPath = wallpaperManager.GetWallpaperPath();
                 if (currentPath != lastWallpaperPath && !string.IsNullOrEmpty(currentPath))
                 {
                     lastWallpaperPath = currentPath;
@@ -143,7 +145,14 @@ namespace WindowScatter
             hwndSource = PresentationSource.FromVisual(this) as HwndSource;
             hwndSource?.AddHook(WndProc);
 
-            lastWallpaperPath = wallpaperManager.GetWallpaperPath();
+            var hwnd = new WindowInteropHelper(this).Handle;
+
+            int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+            exStyle |= WS_EX_TOOLWINDOW;
+            SetWindowLong(hwnd, GWL_EXSTYLE, exStyle);
+
+            if (!useDesktopCapture)
+                lastWallpaperPath = wallpaperManager.GetWallpaperPath();
         }
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -152,16 +161,35 @@ namespace WindowScatter
             {
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    string newPath = wallpaperManager.GetWallpaperPath();
+                    string? newPath = wallpaperManager.GetWallpaperPath();
                     if (newPath != lastWallpaperPath)
                     {
                         lastWallpaperPath = newPath;
                         wallpaperManager.SetWallpaperBackground();
                     }
-                }), System.Windows.Threading.DispatcherPriority.Background);
+                }), DispatcherPriority.Background);
             }
 
             return IntPtr.Zero;
+        }
+
+        #endregion
+
+        #region Thumbnail Keepalive
+
+        private void ThumbnailKeepAlive_Tick(object? sender, EventArgs e)
+        {
+            if (this.Visibility == Visibility.Visible && windowThumbs.Count > 0)
+            {
+                foreach (var thumb in windowThumbs)
+                {
+                    if (thumb.ThumbnailHandle != IntPtr.Zero)
+                    {
+                        SIZE size;
+                        DwmQueryThumbnailSourceSize(thumb.ThumbnailHandle, out size);
+                    }
+                }
+            }
         }
 
         #endregion
@@ -173,7 +201,7 @@ namespace WindowScatter
             using (var curProcess = System.Diagnostics.Process.GetCurrentProcess())
             using (var curModule = curProcess.MainModule)
             {
-                return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule.ModuleName), 0);
+                return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule?.ModuleName), 0);
             }
         }
 
@@ -185,17 +213,8 @@ namespace WindowScatter
 
                 if (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN)
                 {
-                    // Track modifier keys
-                    if (vkCode == VK_LWIN || vkCode == VK_RWIN)
-                        isWinKeyPressed = true;
-                    if (vkCode == VK_CONTROL)
-                        isCtrlPressed = true;
-                    if (vkCode == VK_MENU)
-                        isAltPressed = true;
-                    if (vkCode == VK_SHIFT)
-                        isShiftPressed = true;
+                    UpdateModifierKeyState(vkCode, true);
 
-                    // Check if hotkey matches
                     if (vkCode == configuredHotkey.VirtualKeyCode && CheckModifiersMatch())
                     {
                         suppressStartMenu = true;
@@ -203,14 +222,9 @@ namespace WindowScatter
 
                         this.Dispatcher.BeginInvoke(new Action(async () =>
                         {
-                            // FIXED: Check isTransitioning too
-                            if (this.Visibility == Visibility.Hidden && !isScatterActive && !isAnimatingBack && !isTransitioning)
+                            if (CanActivateScatter())
                             {
                                 await StartScatterAsync();
-                                this.Visibility = Visibility.Visible;
-                                this.Activate();
-                                this.Focus();
-
                                 await System.Threading.Tasks.Task.Delay(250);
                                 ReleaseModifierKeys();
                             }
@@ -221,32 +235,35 @@ namespace WindowScatter
                 }
                 else if (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP)
                 {
-                    // Handle modifier key releases
                     if ((vkCode == VK_LWIN || vkCode == VK_RWIN) && suppressStartMenu)
                     {
                         if ((DateTime.Now - startMenuSuppressionStart).TotalMilliseconds < 500)
                             return (IntPtr)1;
 
                         suppressStartMenu = false;
-                        isWinKeyPressed = false;
                     }
-                    else if (vkCode == VK_LWIN || vkCode == VK_RWIN)
-                        isWinKeyPressed = false;
-                    if (vkCode == VK_CONTROL)
-                        isCtrlPressed = false;
-                    if (vkCode == VK_MENU)
-                        isAltPressed = false;
-                    if (vkCode == VK_SHIFT)
-                        isShiftPressed = false;
+
+                    UpdateModifierKeyState(vkCode, false);
                 }
             }
 
             return CallNextHookEx(hookID, nCode, wParam, lParam);
         }
 
+        private void UpdateModifierKeyState(int vkCode, bool isPressed)
+        {
+            if (vkCode == VK_LWIN || vkCode == VK_RWIN)
+                isWinKeyPressed = isPressed;
+            if (vkCode == VK_CONTROL)
+                isCtrlPressed = isPressed;
+            if (vkCode == VK_MENU)
+                isAltPressed = isPressed;
+            if (vkCode == VK_SHIFT)
+                isShiftPressed = isPressed;
+        }
+
         private bool CheckModifiersMatch()
         {
-            // Check if current modifier state matches configured hotkey
             bool winMatch = ((configuredHotkey.ModifierKeys & 0x08) != 0) == isWinKeyPressed;
             bool ctrlMatch = ((configuredHotkey.ModifierKeys & 0x01) != 0) == isCtrlPressed;
             bool altMatch = ((configuredHotkey.ModifierKeys & 0x02) != 0) == isAltPressed;
@@ -276,10 +293,47 @@ namespace WindowScatter
 
         private void Window_KeyDown(object sender, KeyEventArgs e)
         {
-            // FIXED: Reject ESC spam during transitions
-            if (e.Key == Key.Escape && !isAnimatingBack && !isTransitioning)
+            if (this.Visibility == Visibility.Visible && !animationManager.IsAnimating && !isTransitioning)
             {
+                if (HandleScatterNavigationKey(e.Key))
+                {
+                    e.Handled = true;
+                    return;
+                }
+            }
+
+            if (e.Key == Key.Escape && !animationManager.IsAnimating && !isTransitioning)
+            {
+                e.Handled = true;
                 CleanupAndClose();
+            }
+        }
+
+        private bool HandleScatterNavigationKey(Key key)
+        {
+            switch (key)
+            {
+                case Key.Tab:
+                    SelectNextWindow((Keyboard.Modifiers & ModifierKeys.Shift) == 0 ? 1 : -1);
+                    return true;
+                case Key.Left:
+                    SelectWindowInDirection(-1, 0);
+                    return true;
+                case Key.Right:
+                    SelectWindowInDirection(1, 0);
+                    return true;
+                case Key.Up:
+                    SelectWindowInDirection(0, -1);
+                    return true;
+                case Key.Down:
+                    SelectWindowInDirection(0, 1);
+                    return true;
+                case Key.Return:
+                    if (selectedWindowHandle != IntPtr.Zero)
+                        OnWindowClicked(selectedWindowHandle);
+                    return true;
+                default:
+                    return false;
             }
         }
 
@@ -287,7 +341,9 @@ namespace WindowScatter
         {
             hwndSource?.RemoveHook(WndProc);
             wallpaperCheckTimer?.Stop();
-            hotCornerManager?.Stop();  // NEW: Stop hot corner monitoring
+            thumbnailKeepAliveTimer?.Stop();
+            hotCornerManager?.Stop();
+            desktopCaptureManager?.Cleanup();
 
             if (hookID != IntPtr.Zero)
             {
@@ -302,139 +358,154 @@ namespace WindowScatter
 
         #region Core Scatter Logic
 
+#if DEBUG
+        private const bool VERBOSE_DEBUG = true;
+#else
+        private const bool VERBOSE_DEBUG = false;
+#endif
+
+        private bool CanActivateScatter()
+        {
+            lock (transitionLock)
+            {
+                return !isScatterActive &&
+                       !animationManager.IsAnimating &&
+                       !isTransitioning;
+            }
+        }
+
+        private void ForceWindowToTop(IntPtr hwnd)
+        {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+
+            // Some foreground apps briefly reclaim Z-order, so assert topmost twice.
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
         private async System.Threading.Tasks.Task StartScatterAsync()
         {
-            if (isScatterActive || isAnimatingBack || isTransitioning) return;
-            isScatterActive = true;
+            if (!CanActivateScatter())
+            {
+                // If window is already visible but not on top, force it
+                if (this.Visibility == Visibility.Visible)
+                {
+                    var helper = new WindowInteropHelper(this);
+                    IntPtr ourHwnd = helper.Handle;
+                    if (ourHwnd != IntPtr.Zero)
+                    {
+                        ForceWindowToTop(ourHwnd);
+                        this.Activate();
+                        this.Focus();
+                    }
+                }
+                return;
+            }
+
+            lock (transitionLock)
+            {
+                isScatterActive = true;
+            }
+
+            bool wasIdle = (DateTime.Now - lastActivationTime).TotalSeconds > IDLE_THRESHOLD_SECONDS;
+            lastActivationTime = DateTime.Now;
+
             try
             {
                 var helper = new WindowInteropHelper(this);
                 IntPtr ourHwnd = helper.EnsureHandle();
 
-                if (ourHwnd == IntPtr.Zero)
-                {
-                    MessageBox.Show("Window handle fucked!", "Error");
-                    return;
-                }
+                if (ourHwnd == IntPtr.Zero) return;
 
-                Cleanup();
+                var targetMonitorBounds = MonitorHelper.GetMonitorFromCursor();
 
-                var windows = EnumerateWindows();
-                if (windows.Count == 0)
-                {
-                    MessageBox.Show("No windows found!", "Info");
-                    return;
-                }
+                POINT pt;
+                Win32Interop.GetCursorPos(out pt);
 
-                if (windows.Count > MAX_WINDOWS)
-                    windows = windows.GetRange(0, MAX_WINDOWS);
+                this.WindowState = WindowState.Normal;
+                this.Width = targetMonitorBounds.Width;
+                this.Height = targetMonitorBounds.Height - 1;
+                this.Left = targetMonitorBounds.Left;
+                this.Top = targetMonitorBounds.Top;
 
-                var currentHandles = windows.Select(w => w.Handle).ToList();
+                desktopCaptureManager.SetMonitorBounds(
+                    targetMonitorBounds.Left,
+                    targetMonitorBounds.Top,
+                    targetMonitorBounds.Width,
+                    targetMonitorBounds.Height
+                );
+
+                if (wasIdle) Cleanup();
+                else animationManager.StopAllAnimations();
+
+                var windowsOnTargetMonitor = windowEnumerator.EnumerateVisibleWindows(targetMonitorBounds);
+
+                if (windowsOnTargetMonitor.Count == 0) return;
+
+                var currentHandles = windowsOnTargetMonitor.Select(w => w.Handle).ToList();
                 bool windowStateChanged = HasWindowStateChanged(currentHandles);
 
-                double screenW = SystemParameters.PrimaryScreenWidth;
-                double screenH = SystemParameters.PrimaryScreenHeight;
-
                 List<WindowLayout> layouts;
-
                 if (!windowStateChanged && cachedLayouts != null)
-                {
-                    layouts = ReuseCachedLayouts(windows);
-                }
+                    layouts = ReuseCachedLayouts(windowsOnTargetMonitor);
                 else
                 {
-                    layouts = CalculateNewLayouts(windows, screenW, screenH);
+                    layouts = CalculateNewLayouts(windowsOnTargetMonitor, targetMonitorBounds.Width, targetMonitorBounds.Height);
                     cachedLayouts = new List<WindowLayout>(layouts);
                     lastWindowHandles = currentHandles;
                 }
 
-                SetWindowPos(ourHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-                RegisterThumbnails(layouts, ourHwnd);
+                // Create thumbnails while off-screen to avoid visible setup flicker.
+                SetWindowPos(ourHwnd, HWND_TOPMOST, -30000, 0,
+                    (int)targetMonitorBounds.Width, (int)targetMonitorBounds.Height,
+                    SWP_SHOWWINDOW | SWP_NOACTIVATE);
 
-                if (windowThumbs.Count == 0)
+                this.Visibility = Visibility.Visible;
+
+                await System.Threading.Tasks.Task.Delay(10);
+
+                if (useDesktopCapture)
                 {
-                    MessageBox.Show("No windows captured!", "Info");
-                    return;
+                    bool desktopCaptured = await desktopCaptureManager.CaptureDesktopAsync();
+                    if (!desktopCaptured)
+                    {
+                        useDesktopCapture = false;
+                        wallpaperManager.SetWallpaperBackground();
+                    }
+                }
+                else
+                {
+                    wallpaperManager.SetWallpaperBackground();
                 }
 
-                animStart = DateTime.Now;
-                lastDwmUpdate = DateTime.MinValue;
-                CompositionTarget.Rendering += CompositionTarget_Rendering;
+                thumbnailManager.RegisterThumbnails(layouts, animationManager);
+                SelectClosestWindowToPoint(pt.X - targetMonitorBounds.Left, pt.Y - targetMonitorBounds.Top);
+
+                await System.Threading.Tasks.Task.Delay(16);
+
+                SetWindowPos(ourHwnd, HWND_TOPMOST,
+                    targetMonitorBounds.Left, targetMonitorBounds.Top,
+                    (int)targetMonitorBounds.Width, (int)targetMonitorBounds.Height,
+                    SWP_SHOWWINDOW);
+
+                ForceWindowToTop(ourHwnd);
+
+                this.InvalidateVisual();
+                this.Activate();
+                this.Focus();
+
+                await System.Threading.Tasks.Task.Delay(10);
+                ForceWindowToTop(ourHwnd);
+
+                windowSwitcher = new WindowSwitcher(thumbnailManager, animationManager, windowThumbs, layouts, OnSwitchComplete);
+                thumbnailKeepAliveTimer.Start();
+                animationManager.StartScatterAnimation();
             }
             finally
             {
-                isScatterActive = false;
+                lock (transitionLock) { isScatterActive = false; }
             }
-        }
-
-        private List<WindowInfo> EnumerateWindows()
-        {
-            var windows = new List<WindowInfo>();
-
-            EnumWindows((h, l) =>
-            {
-                try
-                {
-                    if (!IsWindowVisible(h) || IsIconic(h))
-                        return true;
-
-                    int len = GetWindowTextLength(h);
-                    if (len == 0) return true;
-
-                    var sb = new StringBuilder(len + 1);
-                    GetWindowText(h, sb, sb.Capacity);
-                    string title = sb.ToString();
-
-                    if (string.IsNullOrWhiteSpace(title) || IsExcludedWindow(title))
-                        return true;
-
-                    RECT rect;
-                    if (GetWindowRect(h, out rect))
-                    {
-                        int width = rect.Right - rect.Left;
-                        int height = rect.Bottom - rect.Top;
-
-                        if (width >= 100 && height >= 100)
-                        {
-                            // NEW: Check if window is maximized
-                            WINDOWPLACEMENT placement = new WINDOWPLACEMENT();
-                            placement.length = Marshal.SizeOf(placement);
-                            bool isMaximized = false;
-
-                            if (GetWindowPlacement(h, ref placement))
-                            {
-                                isMaximized = (placement.showCmd == SW_SHOWMAXIMIZED);
-                            }
-
-                            windows.Add(new WindowInfo
-                            {
-                                Handle = h,
-                                Title = title,
-                                OriginalRect = rect,
-                                WasMaximized = isMaximized  // NEW: Store maximized state
-                            });
-                        }
-                    }
-                }
-                catch { }
-
-                return true;
-            }, IntPtr.Zero);
-
-            return windows;
-        }
-
-        private bool IsExcludedWindow(string title)
-        {
-            var lower = title.ToLower();
-            return lower.Contains("window scatter") ||
-                   lower.Contains("program manager") ||
-                   lower.Contains("microsoft text input") ||
-                   lower.Contains("windows input") ||
-                   lower.Contains("nvidia geforce") ||
-                   title == "Default IME" ||
-                   title == "MSCTFIME UI" ||
-                   title == "GDI+ Window";
         }
 
         private bool HasWindowStateChanged(List<IntPtr> currentHandles)
@@ -446,7 +517,7 @@ namespace WindowScatter
 
         private List<WindowLayout> ReuseCachedLayouts(List<WindowInfo> windows)
         {
-            var layouts = new List<WindowLayout>(cachedLayouts);
+            var layouts = new List<WindowLayout>(cachedLayouts!);
             var windowsByHandle = windows.ToDictionary(w => w.Handle);
 
             foreach (var layout in layouts)
@@ -460,184 +531,61 @@ namespace WindowScatter
             return layouts;
         }
 
-        #endregion
-
         private List<WindowLayout> CalculateNewLayouts(List<WindowInfo> windows, double screenW, double screenH)
         {
             var calculator = new WindowLayoutCalculator(rng);
             return calculator.CalculateLayouts(windows, screenW, screenH);
         }
 
-        private void RegisterThumbnails(List<WindowLayout> layouts, IntPtr ourHwnd)
-        {
-            foreach (var layout in layouts)
-            {
-                var win = layout.Window;
-                bool wasMinimized = IsIconic(win.Handle);
-
-                IntPtr thumbHandle;
-                int res = DwmRegisterThumbnail(ourHwnd, win.Handle, out thumbHandle);
-
-                if (res != 0 || thumbHandle == IntPtr.Zero)
-                    continue;
-
-                RECT currentRect = win.OriginalRect;
-                double startX = currentRect.Left;
-                double startY = currentRect.Top;
-                double startW = currentRect.Right - currentRect.Left;
-                double startH = currentRect.Bottom - currentRect.Top;
-
-                var clickBorder = new Border
-                {
-                    Background = System.Windows.Media.Brushes.Transparent,
-                    Width = layout.Width,
-                    Height = layout.Height,
-                    Cursor = Cursors.Hand
-                };
-
-                Canvas.SetLeft(clickBorder, layout.X);
-                Canvas.SetTop(clickBorder, layout.Y);
-
-                var thumb = new WindowThumb
-                {
-                    WindowHandle = win.Handle,
-                    ThumbnailHandle = thumbHandle,
-                    WasMinimized = wasMinimized,
-                    ClickBorder = clickBorder,
-
-                    StartX = startX,
-                    StartY = startY,
-                    StartWidth = startW,
-                    StartHeight = startH,
-
-                    TargetX = layout.X,
-                    TargetY = layout.Y,
-                    TargetWidth = layout.Width,
-                    TargetHeight = layout.Height,
-
-                    CurrentX = startX,
-                    CurrentY = startY,
-                    CurrentWidth = startW,
-                    CurrentHeight = startH
-                };
-
-                UpdateThumbnailPosition(thumb);
-
-                clickBorder.MouseDown += (s, e) =>
-                {
-                    // FIXED: Ignore ALL clicks during any state transition
-                    if (isScatterActive || isAnimatingBack || isTransitioning)
-                    {
-                        e.Handled = true;
-                        return;
-                    }
-
-                    SwitchToWindow(thumb.WindowHandle);
-                    e.Handled = true;
-                };
-
-                ScatterCanvas.Children.Add(clickBorder);
-                windowThumbs.Add(thumb);
-            }
-        }
-
-
-        #region Animation
-
-        private void CompositionTarget_Rendering(object sender, EventArgs e)
-        {
-            double elapsed = (DateTime.Now - animStart).TotalSeconds;
-            double progress = Math.Min(elapsed / ANIMATION_DURATION, 1.0);
-            double eased = 1 - Math.Pow(1 - progress, 3);
-
-            // Animate blur
-            currentBlurRadius = Lerp(0, TARGET_BLUR_RADIUS, eased);
-            if (BackgroundImage.Effect is BlurEffect blurEffect)
-            {
-                blurEffect.Radius = currentBlurRadius;
-            }
-
-            var now = DateTime.Now;
-            bool canUpdateDwm = (lastDwmUpdate == DateTime.MinValue) ||
-                                (now - lastDwmUpdate).TotalMilliseconds >= DWM_UPDATE_MIN_MS;
-
-            foreach (var thumb in windowThumbs)
-            {
-                thumb.CurrentX = Lerp(thumb.StartX, thumb.TargetX, eased);
-                thumb.CurrentY = Lerp(thumb.StartY, thumb.TargetY, eased);
-                thumb.CurrentWidth = Lerp(thumb.StartWidth, thumb.TargetWidth, eased);
-                thumb.CurrentHeight = Lerp(thumb.StartHeight, thumb.TargetHeight, eased);
-
-                if (canUpdateDwm)
-                {
-                    UpdateThumbnailPosition(thumb);
-                }
-            }
-
-            if (canUpdateDwm)
-                lastDwmUpdate = now;
-
-            if (progress >= 1.0)
-            {
-                CompositionTarget.Rendering -= CompositionTarget_Rendering;
-
-                foreach (var thumb in windowThumbs)
-                {
-                    UpdateThumbnailPosition(thumb);
-                }
-            }
-        }
-
-        private void UpdateThumbnailPosition(WindowThumb thumb)
-        {
-            sharedProps.opacity = 255;
-            sharedProps.rcDestination.Left = (int)Math.Round(thumb.CurrentX);
-            sharedProps.rcDestination.Top = (int)Math.Round(thumb.CurrentY);
-            sharedProps.rcDestination.Right = (int)Math.Round(thumb.CurrentX + thumb.CurrentWidth);
-            sharedProps.rcDestination.Bottom = (int)Math.Round(thumb.CurrentY + thumb.CurrentHeight);
-
-            DwmUpdateThumbnailProperties(thumb.ThumbnailHandle, ref sharedProps);
-        }
-
-        private static double Lerp(double start, double end, double t)
-        {
-            return start + (end - start) * t;
-        }
-
         #endregion
 
-        #region Cleanup & Window Switching
+        #region Window Click Handling
 
-        private void Cleanup()
+        private void OnWindowClicked(IntPtr windowHandle)
         {
-            currentBlurRadius = 0;
-            if (BackgroundImage.Effect is BlurEffect blurEffect)
+            if (VERBOSE_DEBUG)
             {
-                blurEffect.Radius = 0;
-            }
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("=== CLICK DEBUG ===");
+                sb.AppendLine($"Timestamp: {DateTime.Now:HH:mm:ss.fff}");
+                sb.AppendLine($"Window: {windowHandle}");
+                sb.AppendLine($"isScatterActive: {isScatterActive}");
+                sb.AppendLine($"isAnimating: {animationManager.IsAnimating}");
+                sb.AppendLine($"isTransitioning: {isTransitioning}");
 
-            CompositionTarget.Rendering -= CompositionTarget_Rendering;
-
-            foreach (var thumb in windowThumbs)
-            {
-                try
+                var thumb = windowThumbs.FirstOrDefault(t => t.WindowHandle == windowHandle);
+                if (thumb != null)
                 {
-                    if (thumb.ThumbnailHandle != IntPtr.Zero)
-                        DwmUnregisterThumbnail(thumb.ThumbnailHandle);
+                    sb.AppendLine($"Border size: {thumb.ClickBorder.Width}x{thumb.ClickBorder.Height}");
+                    sb.AppendLine($"Border pos: {Canvas.GetLeft(thumb.ClickBorder)},{Canvas.GetTop(thumb.ClickBorder)}");
+                    sb.AppendLine($"Thumb size: {thumb.CurrentWidth}x{thumb.CurrentHeight}");
+                    sb.AppendLine($"Thumb pos: {thumb.CurrentX},{thumb.CurrentY}");
+                    sb.AppendLine($"IsHitTestVisible: {thumb.ClickBorder.IsHitTestVisible}");
+
+                    double sizeDiff = Math.Abs(thumb.ClickBorder.Width - thumb.CurrentWidth) +
+                                     Math.Abs(thumb.ClickBorder.Height - thumb.CurrentHeight);
+                    double posDiff = Math.Abs(Canvas.GetLeft(thumb.ClickBorder) - thumb.CurrentX) +
+                                    Math.Abs(Canvas.GetTop(thumb.ClickBorder) - thumb.CurrentY);
+
+                    sb.AppendLine($"Size diff: {sizeDiff:F2}px");
+                    sb.AppendLine($"Pos diff: {posDiff:F2}px");
+
+                    if (sizeDiff > 1.0 || posDiff > 1.0)
+                    {
+                        sb.AppendLine("⚠️ WARNING: MISMATCH DETECTED!");
+                    }
                 }
-                catch { }
+                else
+                {
+                    sb.AppendLine("❌ ERROR: Thumb not found!");
+                }
+
+                System.Diagnostics.Debug.WriteLine(sb.ToString());
             }
 
-            ScatterCanvas.Children.Clear();
-            windowThumbs.Clear();
-        }
-
-        private void SwitchToWindow(IntPtr windowHandle)
-        {
-            // FIXED: Use lock to prevent concurrent transitions
             lock (transitionLock)
             {
-                if (isAnimatingBack || isScatterActive || isTransitioning)
+                if (isScatterActive || animationManager.IsAnimating || isTransitioning)
                     return;
 
                 isTransitioning = true;
@@ -645,256 +593,163 @@ namespace WindowScatter
 
             try
             {
-                var clickedThumb = windowThumbs.FirstOrDefault(t => t.WindowHandle == windowHandle);
-                if (clickedThumb == null)
-                {
-                    lock (transitionLock) { isTransitioning = false; }
-                    return;
-                }
-
-                // Bring its Border to the top of the canvas z-order
-                ScatterCanvas.Children.Remove(clickedThumb.ClickBorder);
-                ScatterCanvas.Children.Add(clickedThumb.ClickBorder);
-
-                // Maintain order in the list
-                windowThumbs.Remove(clickedThumb);
-                windowThumbs.Add(clickedThumb);
-
-                // SAFELY bump DWM Z-order of the clicked window
-                if (clickedThumb.ThumbnailHandle != IntPtr.Zero)
-                {
-                    DwmUnregisterThumbnail(clickedThumb.ThumbnailHandle);
-                    clickedThumb.ThumbnailHandle = IntPtr.Zero;
-                }
-
-                IntPtr newThumb;
-                if (DwmRegisterThumbnail(new WindowInteropHelper(this).Handle,
-                    clickedThumb.WindowHandle, out newThumb) == 0)
-                {
-                    clickedThumb.ThumbnailHandle = newThumb;
-                    UpdateThumbnailPosition(clickedThumb);
-                }
-
-                // Capture state IMMEDIATELY before the window realizes what's happening
-                Task.Run(() =>
-                {
-                    // Capture ALL positions RIGHT NOW while windows are still scattered
-                    var capturedStates = new List<(IntPtr handle, double x, double y, double w, double h)>();
-
-                    foreach (var thumb in windowThumbs)
-                    {
-                        RECT rect;
-                        if (GetWindowRect(thumb.WindowHandle, out rect))
-                        {
-                            capturedStates.Add((
-                                thumb.WindowHandle,
-                                rect.Left,
-                                rect.Top,
-                                rect.Right - rect.Left,
-                                rect.Bottom - rect.Top
-                            ));
-                        }
-                    }
-
-                    // Check if window was maximized
-                    var layout = cachedLayouts?.FirstOrDefault(l => l.Window.Handle == windowHandle);
-                    bool wasMaximized = layout != null && layout.Window.WasMaximized;
-
-                    // Small delay BEFORE any window operations
-                    System.Threading.Thread.Sleep(5);
-
-                    Dispatcher.Invoke(() =>
-                    {
-                        try
-                        {
-                            // Apply captured positions to thumbnails
-                            foreach (var state in capturedStates)
-                            {
-                                var thumb = windowThumbs.FirstOrDefault(t => t.WindowHandle == state.handle);
-                                if (thumb != null)
-                                {
-                                    thumb.StartX = state.x;
-                                    thumb.StartY = state.y;
-                                    thumb.StartWidth = state.w;
-                                    thumb.StartHeight = state.h;
-                                }
-                            }
-
-                            // Re-register thumbnails with captured positions
-                            foreach (var thumb in windowThumbs)
-                            {
-                                if (thumb.ThumbnailHandle == IntPtr.Zero)
-                                {
-                                    IntPtr thumbHandle;
-                                    if (DwmRegisterThumbnail(new WindowInteropHelper(this).Handle,
-                                        thumb.WindowHandle, out thumbHandle) == 0)
-                                    {
-                                        thumb.ThumbnailHandle = thumbHandle;
-                                    }
-                                }
-
-                                UpdateThumbnailPosition(thumb);
-                            }
-
-                            // Start animation FIRST, THEN restore window
-                            AnimateBackToOriginal(async () =>
-                            {
-                                // Wait for animation to complete
-                                await System.Threading.Tasks.Task.Delay(15);
-
-                                // NOW restore the window AFTER we're hidden
-                                if (wasMaximized)
-                                {
-                                    ShowWindow(windowHandle, SW_SHOWMAXIMIZED);
-                                }
-                                else
-                                {
-                                    ShowWindow(windowHandle, SW_RESTORE);
-                                }
-
-                                SetForegroundWindow(windowHandle);
-
-                                this.Visibility = Visibility.Hidden;
-
-                                await System.Threading.Tasks.Task.Delay(15);
-
-                                Dispatcher.BeginInvoke(new Action(() =>
-                                {
-                                    Cleanup();
-                                    lock (transitionLock) { isTransitioning = false; }
-                                }), DispatcherPriority.Background);
-                            });
-
-                        }
-                        catch
-                        {
-                            lock (transitionLock) { isTransitioning = false; }
-                        }
-                    });
-                });
+                thumbnailKeepAliveTimer.Stop();
+                windowSwitcher!.SwitchToWindow(windowHandle, Dispatcher);
             }
             catch
             {
-                lock (transitionLock) { isTransitioning = false; }
+                lock (transitionLock)
+                {
+                    isTransitioning = false;
+                }
             }
         }
 
+        private void OnWindowHovered(IntPtr windowHandle)
+        {
+            if (this.Visibility == Visibility.Visible && !animationManager.IsAnimating && !isTransitioning)
+                SelectWindow(windowHandle);
+        }
+
+        private void SelectClosestWindowToPoint(double x, double y)
+        {
+            var closest = windowThumbs
+                .OrderBy(t => DistanceSquared(GetCenterX(t) - x, GetCenterY(t) - y))
+                .FirstOrDefault();
+
+            SelectWindow(closest?.WindowHandle ?? IntPtr.Zero);
+        }
+
+        private void SelectNextWindow(int direction)
+        {
+            if (windowThumbs.Count == 0) return;
+
+            int currentIndex = windowThumbs.FindIndex(t => t.WindowHandle == selectedWindowHandle);
+            if (currentIndex < 0) currentIndex = direction > 0 ? -1 : 0;
+
+            int nextIndex = (currentIndex + direction + windowThumbs.Count) % windowThumbs.Count;
+            SelectWindow(windowThumbs[nextIndex].WindowHandle);
+        }
+
+        private void SelectWindowInDirection(int dx, int dy)
+        {
+            if (windowThumbs.Count == 0) return;
+
+            var current = windowThumbs.FirstOrDefault(t => t.WindowHandle == selectedWindowHandle) ?? windowThumbs[0];
+            double currentX = GetCenterX(current);
+            double currentY = GetCenterY(current);
+
+            var candidate = windowThumbs
+                .Where(t => t.WindowHandle != current.WindowHandle)
+                .Select(t => new
+                {
+                    Thumb = t,
+                    OffsetX = GetCenterX(t) - currentX,
+                    OffsetY = GetCenterY(t) - currentY
+                })
+                .Where(c => (dx == 0 || Math.Sign(c.OffsetX) == dx) && (dy == 0 || Math.Sign(c.OffsetY) == dy))
+                .OrderByDescending(c => dx != 0 ? Math.Abs(c.OffsetX) / Math.Max(1, Math.Abs(c.OffsetY)) : Math.Abs(c.OffsetY) / Math.Max(1, Math.Abs(c.OffsetX)))
+                .ThenBy(c => DistanceSquared(c.OffsetX, c.OffsetY))
+                .FirstOrDefault();
+
+            if (candidate != null)
+                SelectWindow(candidate.Thumb.WindowHandle);
+            else
+                SelectNextWindow(dx + dy > 0 ? 1 : -1);
+        }
+
+        private void SelectWindow(IntPtr windowHandle)
+        {
+            selectedWindowHandle = windowHandle;
+            thumbnailManager?.SetSelectedWindow(windowHandle);
+        }
+
+        private static double GetCenterX(WindowThumb thumb) => thumb.TargetX + thumb.TargetWidth / 2.0;
+        private static double GetCenterY(WindowThumb thumb) => thumb.TargetY + thumb.TargetHeight / 2.0;
+        private static double DistanceSquared(double dx, double dy) => dx * dx + dy * dy;
+
+        private void OnSwitchComplete()
+        {
+            this.Visibility = Visibility.Hidden;
+
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    FullCleanup();
+                }
+                finally
+                {
+                    lock (transitionLock)
+                    {
+                        isTransitioning = false;
+                        isScatterActive = false;
+                    }
+                }
+            }), DispatcherPriority.Background);
+        }
+
+        #endregion
+
+        #region Cleanup
+
+        private void Cleanup()
+        {
+            thumbnailKeepAliveTimer?.Stop();
+            animationManager?.StopAllAnimations();
+            thumbnailManager?.CleanupAllThumbnails();
+            selectedWindowHandle = IntPtr.Zero;
+        }
+
+        private void FullCleanup()
+        {
+            thumbnailKeepAliveTimer?.Stop();
+            animationManager?.StopAllAnimations();
+            thumbnailManager?.CleanupAllThumbnails();
+
+            cachedLayouts = null;
+            lastWindowHandles = null;
+            selectedWindowHandle = IntPtr.Zero;
+
+            desktopCaptureManager?.Cleanup();
+        }
 
         private void CleanupAndClose()
         {
-            // FIXED: Use lock for transition guard
             lock (transitionLock)
             {
-                if (isAnimatingBack || isTransitioning)
+                if (animationManager.IsAnimating || isTransitioning)
                     return;
 
-                isAnimatingBack = true;
                 isTransitioning = true;
             }
 
-            AnimateBackToOriginal(async () =>
+            thumbnailKeepAliveTimer.Stop();
+
+            animationManager.StartReturnAnimation(async () =>
             {
                 this.Visibility = Visibility.Hidden;
 
-                await System.Threading.Tasks.Task.Delay(15);
+                await System.Threading.Tasks.Task.Delay(50);
 
-                Dispatcher.BeginInvoke(new Action(() =>
+                _ = Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    Cleanup();
-
-                    lock (transitionLock)
+                    try
                     {
-                        isAnimatingBack = false;
-                        isTransitioning = false;
+                        FullCleanup();
+                    }
+                    finally
+                    {
+                        lock (transitionLock)
+                        {
+                            isTransitioning = false;
+                            isScatterActive = false;
+                        }
                     }
                 }), DispatcherPriority.Background);
             });
-
         }
 
-        private void AnimateBackToOriginal(Action onComplete)
-        {
-            isReturningToOriginal = true;
-
-            // Swap Start/Target so animation goes backwards
-            foreach (var thumb in windowThumbs)
-            {
-                // Remember current position
-                double tempX = thumb.StartX;
-                double tempY = thumb.StartY;
-                double tempW = thumb.StartWidth;
-                double tempH = thumb.StartHeight;
-
-                // Start from current scattered position
-                thumb.StartX = thumb.TargetX;
-                thumb.StartY = thumb.TargetY;
-                thumb.StartWidth = thumb.TargetWidth;
-                thumb.StartHeight = thumb.TargetHeight;
-
-                // Target is original position
-                thumb.TargetX = tempX;
-                thumb.TargetY = tempY;
-                thumb.TargetWidth = tempW;
-                thumb.TargetHeight = tempH;
-
-                // Reset current to start
-                thumb.CurrentX = thumb.StartX;
-                thumb.CurrentY = thumb.StartY;
-                thumb.CurrentWidth = thumb.StartWidth;
-                thumb.CurrentHeight = thumb.StartHeight;
-            }
-
-            animStart = DateTime.Now;
-            lastDwmUpdate = DateTime.MinValue;
-
-            // Store callback
-            Action storedCallback = onComplete;
-
-            // Rendering loop
-            EventHandler renderHandler = null;
-            renderHandler = (s, e) =>
-            {
-                double elapsed = (DateTime.Now - animStart).TotalSeconds;
-                double progress = Math.Min(elapsed / ANIMATION_DURATION, 1.0);
-                double eased = 1 - Math.Pow(1 - progress, 3);
-
-                // Animate blur BACKWARDS (from blurred to clear)
-                currentBlurRadius = Lerp(TARGET_BLUR_RADIUS, 0, eased);
-                if (BackgroundImage.Effect is BlurEffect blurEffect)
-                {
-                    blurEffect.Radius = currentBlurRadius;
-                }
-
-                var now = DateTime.Now;
-                bool canUpdateDwm = (lastDwmUpdate == DateTime.MinValue) ||
-                                    (now - lastDwmUpdate).TotalMilliseconds >= DWM_UPDATE_MIN_MS;
-
-                foreach (var thumb in windowThumbs)
-                {
-                    thumb.CurrentX = Lerp(thumb.StartX, thumb.TargetX, eased);
-                    thumb.CurrentY = Lerp(thumb.StartY, thumb.TargetY, eased);
-                    thumb.CurrentWidth = Lerp(thumb.StartWidth, thumb.TargetWidth, eased);
-                    thumb.CurrentHeight = Lerp(thumb.StartHeight, thumb.TargetHeight, eased);
-
-                    if (canUpdateDwm)
-                    {
-                        UpdateThumbnailPosition(thumb);
-                    }
-                }
-
-                if (canUpdateDwm)
-                    lastDwmUpdate = now;
-
-                if (progress >= 1.0)
-                {
-                    CompositionTarget.Rendering -= renderHandler;
-                    isReturningToOriginal = false;
-                    storedCallback?.Invoke();
-                }
-            };
-
-            CompositionTarget.Rendering += renderHandler;
-        }
         #endregion
     }
 }

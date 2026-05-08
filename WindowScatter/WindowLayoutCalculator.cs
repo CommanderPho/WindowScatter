@@ -20,7 +20,6 @@ namespace WindowScatter
             double availableW = screenW - (2 * padding);
             double availableH = screenH - (2 * padding);
 
-            // Calculate scale factor
             double totalOriginalArea = 0;
             foreach (var win in windows)
             {
@@ -32,13 +31,10 @@ namespace WindowScatter
             double scaleFactor = Math.Sqrt(targetTotalArea / totalOriginalArea);
             scaleFactor = Math.Max(0.15, Math.Min(0.5, scaleFactor));
 
-            // Create initial layouts with scaled sizes
             var layouts = CreateScaledLayouts(windows, scaleFactor);
 
-            // Sort by area for better packing
             layouts = layouts.OrderByDescending(l => l.Width * l.Height).ToList();
 
-            // Position the windows
             var placedWindows = new List<Rect>();
 
             if (layouts.Count == 2)
@@ -50,7 +46,7 @@ namespace WindowScatter
                 PositionMultipleWindows(layouts, screenW, screenH, padding, availableW, availableH, placedWindows);
             }
 
-            // Assign windows to nearest positions (proximity-based)
+            // Preserve the user's spatial context by assigning each window to the nearest slot.
             layouts = AssignWindowsToLayouts(windows, layouts);
 
             layouts.Reverse();
@@ -70,12 +66,10 @@ namespace WindowScatter
                 double w = origW * scaleFactor;
                 double h = origH * scaleFactor;
 
-                // Add size variance for organic feel
                 double sizeVariance = 0.85 + (rng.NextDouble() * 0.3);
                 w *= sizeVariance;
                 h *= sizeVariance;
 
-                // Clamp to reasonable sizes
                 w = Math.Max(180, Math.Min(600, w));
                 h = Math.Max(120, Math.Min(450, h));
 
@@ -124,7 +118,6 @@ namespace WindowScatter
                 double originalWidth = layout.Width;
                 double originalHeight = layout.Height;
 
-                // First window goes near center
                 if (placedWindows.Count == 0)
                 {
                     bestRect = PositionFirstWindow(layout, screenW, screenH, padding);
@@ -136,7 +129,6 @@ namespace WindowScatter
                     continue;
                 }
 
-                // Try to place subsequent windows
                 for (int resizeAttempt = 0; resizeAttempt < maxResizeAttempts && !foundValidPosition; resizeAttempt++)
                 {
                     if (resizeAttempt > 0)
@@ -146,7 +138,7 @@ namespace WindowScatter
                         layout.Height = Math.Max(80, originalHeight * shrinkFactor);
                     }
 
-                    int gridSteps = 50;
+                    int gridSteps = 20;
                     double stepX = Math.Max(1, (availableW - layout.Width) / gridSteps);
                     double stepY = Math.Max(1, (availableH - layout.Height) / gridSteps);
 
@@ -177,7 +169,6 @@ namespace WindowScatter
                     }
                 }
 
-                // Last resort: center it
                 if (!foundValidPosition)
                 {
                     double centerX = (screenW - layout.Width) / 2;
@@ -237,28 +228,23 @@ namespace WindowScatter
             double currentX = x + layout.Width / 2;
             double currentY = y + layout.Height / 2;
 
-            // Balance distribution
             int leftCount = placedWindows.Count(p => (p.X + p.Width / 2) < screenCenterX);
             int rightCount = placedWindows.Count(p => (p.X + p.Width / 2) >= screenCenterX);
             int topCount = placedWindows.Count(p => (p.Y + p.Height / 2) < screenCenterY);
             int bottomCount = placedWindows.Count(p => (p.Y + p.Height / 2) >= screenCenterY);
 
-            // Horizontal balance
             if (leftCount > rightCount && currentX >= screenCenterX)
                 score -= 600 * (leftCount - rightCount);
             else if (rightCount > leftCount && currentX < screenCenterX)
                 score -= 600 * (rightCount - leftCount);
 
-            // Vertical balance
             if (topCount > bottomCount && currentY >= screenCenterY)
                 score -= 400 * (topCount - bottomCount);
             else if (bottomCount > topCount && currentY < screenCenterY)
                 score -= 400 * (bottomCount - topCount);
 
-            // Quadrant balancing
             score += CalculateQuadrantScore(currentX, currentY, screenCenterX, screenCenterY, placedWindows);
 
-            // Corner proximity
             double padding = 50;
             double distToTopLeft = Math.Sqrt(Math.Pow(x - padding, 2) + Math.Pow(y - padding, 2));
             double distToTopRight = Math.Sqrt(Math.Pow(x + layout.Width - (screenW - padding), 2) + Math.Pow(y - padding, 2));
@@ -267,7 +253,6 @@ namespace WindowScatter
             double nearestCorner = Math.Min(Math.Min(distToTopLeft, distToTopRight), Math.Min(distToBottomLeft, distToBottomRight));
             score += nearestCorner * 0.5;
 
-            // Edge proximity
             double distToLeftEdge = Math.Abs(x - padding);
             double distToRightEdge = Math.Abs(x + layout.Width - (screenW - padding));
             double distToTopEdge = Math.Abs(y - padding);
@@ -275,11 +260,9 @@ namespace WindowScatter
             double nearestEdge = Math.Min(Math.Min(distToLeftEdge, distToRightEdge), Math.Min(distToTopEdge, distToBottomEdge));
             score += nearestEdge * 0.05;
 
-            // Penalize center
             double distFromCenter = Math.Sqrt(Math.Pow(currentX - screenCenterX, 2) + Math.Pow(currentY - screenCenterY, 2));
             score += distFromCenter * 0.20;
 
-            // Spacing from other windows
             double minDistToPlaced = double.MaxValue;
             foreach (var placed in placedWindows)
             {
@@ -290,7 +273,6 @@ namespace WindowScatter
             }
             score += minDistToPlaced * 0.05;
 
-            // Randomness
             score += rng.NextDouble() * 3;
 
             return score;
@@ -332,7 +314,7 @@ namespace WindowScatter
                 double winCenterX = (win.OriginalRect.Left + win.OriginalRect.Right) / 2.0;
                 double winCenterY = (win.OriginalRect.Top + win.OriginalRect.Bottom) / 2.0;
 
-                WindowLayout closestLayout = null;
+                WindowLayout? closestLayout = null;
                 double minDistance = double.MaxValue;
 
                 foreach (var layout in availableLayouts)
@@ -358,7 +340,6 @@ namespace WindowScatter
                 }
             }
 
-            // Recalculate sizes for correct aspect ratios
             var finalLayouts = new List<WindowLayout>();
 
             foreach (var win in windows)

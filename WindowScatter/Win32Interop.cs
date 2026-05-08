@@ -8,6 +8,8 @@ namespace WindowScatter
     {
         #region Window Enumeration
 
+
+
         internal delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll")]
@@ -50,44 +52,7 @@ namespace WindowScatter
         [DllImport("dwmapi.dll")]
         internal static extern int DwmUpdateThumbnailProperties(IntPtr hThumb, ref DWM_THUMBNAIL_PROPERTIES props);
 
-        [DllImport("dwmapi.dll")]
-        internal static extern int DwmQueryThumbnailSourceSize(IntPtr hThumb, out PSIZE size);
-
-        [DllImport("user32.dll")]
-        private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
-
-        [DllImport("gdi32.dll")]
-        private static extern bool BitBlt(IntPtr hdcDest, int nXDest, int nYDest, int nWidth, int nHeight,
-                                          IntPtr hdcSrc, int nXSrc, int nYSrc, uint dwRop);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetWindowDC(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-
-        private const int SRCCOPY = 0x00CC0020;
-
-        [DllImport("gdi32.dll")]
-        private static extern bool DeleteObject(IntPtr hObject);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-
-        [DllImport("user32.dll")]
-        internal static extern IntPtr BeginDeferWindowPos(int nNumWindows);
-
-        [DllImport("user32.dll")]
-        internal static extern IntPtr DeferWindowPos(IntPtr hWinPosInfo, IntPtr hWnd,
-            IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
-
-        [DllImport("user32.dll")]
-        internal static extern bool EndDeferWindowPos(IntPtr hWinPosInfo);
-
-        internal const uint SWP_NOREDRAW = 0x0008;
-
-        public const int SWP_HIDEWINDOW = 0x0080;
-
+        public const int DWM_TNP_SOURCECLIENTAREAONLY = 0x00000010;
 
 
         [StructLayout(LayoutKind.Sequential)]
@@ -103,10 +68,34 @@ namespace WindowScatter
             public bool fSourceClientAreaOnly;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [DllImport("dwmapi.dll")]
+        internal static extern int DwmFlush();
+
+        public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmQueryThumbnailSourceSize(IntPtr hThumbnail, out SIZE pSize);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SIZE
+        {
+            public int cx;
+            public int cy;
+        }
+
         internal const int DWM_TNP_RECTDESTINATION = 0x00000001;
         internal const int DWM_TNP_OPACITY = 0x00000004;
         internal const int DWM_TNP_VISIBLE = 0x00000008;
-
         #endregion
 
         #region Keyboard Hook
@@ -123,8 +112,10 @@ namespace WindowScatter
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         internal static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
+
+
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        internal static extern IntPtr GetModuleHandle(string lpModuleName);
+        internal static extern IntPtr GetModuleHandle(string? lpModuleName);
 
         [DllImport("user32.dll")]
         internal static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -145,11 +136,10 @@ namespace WindowScatter
         internal const int WM_SYSKEYUP = 0x0105;
         internal const uint KEYEVENTF_KEYUP = 0x0002;
 
-        // Virtual key codes
         internal const int VK_TAB = 0x09;
         internal const int VK_SHIFT = 0x10;
         internal const int VK_CONTROL = 0x11;
-        internal const int VK_MENU = 0x12; // Alt
+        internal const int VK_MENU = 0x12;
         internal const int VK_W = 0x57;
         internal const int VK_LWIN = 0x5B;
         internal const int VK_RWIN = 0x5C;
@@ -164,15 +154,10 @@ namespace WindowScatter
 
         #region Window Constants
 
-        internal const int SW_MINIMIZE = 6;
         internal const int SW_RESTORE = 9;
-        internal const int SW_SHOW = 5;
-        internal const int SW_SHOWNOACTIVATE = 4;
 
         internal static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         internal static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
-        internal static readonly IntPtr HWND_BOTTOM = new IntPtr(1);
-        internal static readonly IntPtr HWND_TOP = new IntPtr(0);
 
         internal const uint SWP_NOMOVE = 0x0002;
         internal const uint SWP_NOSIZE = 0x0001;
@@ -188,12 +173,6 @@ namespace WindowScatter
         internal struct RECT
         {
             public int Left, Top, Right, Bottom;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct PSIZE
-        {
-            public int x, y;
         }
 
         [DllImport("user32.dll")]
@@ -214,5 +193,13 @@ namespace WindowScatter
         }
 
         #endregion
+
+        [DllImport("user32.dll")]
+        public static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+        internal const int DWM_TNP_RECTSOURCE = 0x00000002;
     }
 }

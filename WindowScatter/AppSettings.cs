@@ -23,13 +23,13 @@ namespace WindowScatter
                 if (File.Exists(SettingsPath))
                 {
                     string json = File.ReadAllText(SettingsPath);
-                    return JsonSerializer.Deserialize<AppSettings>(json);
+                    return JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
                 }
             }
             catch { }
 
             var defaultSettings = new AppSettings();
-            defaultSettings.Save(); // CREATE IT NOW
+            defaultSettings.Save();
             return defaultSettings;
         }
 
@@ -40,7 +40,7 @@ namespace WindowScatter
                 var options = new JsonSerializerOptions
                 {
                     WriteIndented = true,
-                    Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping // THIS IS THE FIX
+                    Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
                 };
 
                 string json = JsonSerializer.Serialize(this, options);

@@ -1,5 +1,6 @@
 using System;
 using System.Windows.Controls;
+using System.Windows.Shapes;
 using static WindowScatter.Win32Interop;
 
 namespace WindowScatter
@@ -7,7 +8,7 @@ namespace WindowScatter
     internal class WindowInfo
     {
         public IntPtr Handle;
-        public string Title;
+        public string Title = string.Empty;
         public RECT OriginalRect;
         public bool WasMaximized;
     }
@@ -17,11 +18,9 @@ namespace WindowScatter
         public IntPtr WindowHandle { get; set; }
         public IntPtr ThumbnailHandle { get; set; }
         public bool WasMinimized { get; set; }
-        public Border ClickBorder { get; set; }
-
-        // NEW: Screenshot support
-        public System.Windows.Controls.Image ScreenshotImage { get; set; }
-        public bool IsUsingScreenshot { get; set; }
+        public Border ClickBorder { get; set; } = null!;
+        public Border HighlightBorder { get; set; } = null!;
+        public TextBlock TitleLabel { get; set; } = null!;
 
         public double StartX { get; set; }
         public double StartY { get; set; }
@@ -41,7 +40,7 @@ namespace WindowScatter
 
     internal class WindowLayout
     {
-        public WindowInfo Window;
+        public WindowInfo Window = null!;
         public double Width;
         public double Height;
         public double X;

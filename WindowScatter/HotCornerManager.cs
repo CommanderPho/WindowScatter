@@ -22,7 +22,7 @@ namespace WindowScatter
         private readonly AppSettings settings;
         private DateTime? cornerEnteredTime = null;
         private bool isInCorner = false;
-        private const int CORNER_THRESHOLD = 5; // pixels from corner
+        private const int CORNER_THRESHOLD = 5;
         private bool isOnCooldown = false;
 
         public HotCornerManager(AppSettings settings, Action onTriggered)
@@ -31,7 +31,7 @@ namespace WindowScatter
             this.onHotCornerTriggered = onTriggered;
 
             timer = new DispatcherTimer();
-            timer.Interval = TimeSpan.FromMilliseconds(50); // Check every 50ms
+            timer.Interval = TimeSpan.FromMilliseconds(50);
             timer.Tick += Timer_Tick;
         }
 
@@ -50,7 +50,7 @@ namespace WindowScatter
             isInCorner = false;
         }
 
-        private void Timer_Tick(object sender, EventArgs e)
+        private void Timer_Tick(object? sender, EventArgs e)
         {
             if (!settings.EnableHotCorners)
                 return;
@@ -66,29 +66,24 @@ namespace WindowScatter
 
             if (inCornerNow && !isInCorner)
             {
-                // Just entered corner
                 isInCorner = true;
                 cornerEnteredTime = DateTime.Now;
             }
             else if (inCornerNow && isInCorner)
             {
-                // Still in corner - check if delay elapsed
                 if (cornerEnteredTime.HasValue)
                 {
                     var elapsed = (DateTime.Now - cornerEnteredTime.Value).TotalMilliseconds;
                     if (elapsed >= settings.HotCornerDelay)
                     {
-                        // Don't trigger if already on cooldown
                         if (isOnCooldown)
                             return;
 
-                        // TRIGGER IT
                         isOnCooldown = true;
                         cornerEnteredTime = null;
                         isInCorner = false;
                         onHotCornerTriggered?.Invoke();
 
-                        // Reset cooldown after 2 seconds
                         var cooldownTimer = new DispatcherTimer();
                         cooldownTimer.Interval = TimeSpan.FromSeconds(2);
                         cooldownTimer.Tick += (s, args) =>
@@ -102,7 +97,6 @@ namespace WindowScatter
             }
             else if (!inCornerNow && isInCorner)
             {
-                // Left corner before delay
                 isInCorner = false;
                 cornerEnteredTime = null;
             }

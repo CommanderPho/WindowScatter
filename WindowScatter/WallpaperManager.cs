@@ -24,7 +24,7 @@ namespace WindowScatter
         {
             try
             {
-                string wallpaperPath = GetWallpaperPath();
+                string? wallpaperPath = GetWallpaperPath();
 
                 if (!string.IsNullOrEmpty(wallpaperPath) && File.Exists(wallpaperPath))
                 {
@@ -76,15 +76,15 @@ namespace WindowScatter
             }
         }
 
-        public string GetWallpaperPath()
+        public string? GetWallpaperPath()
         {
             try
             {
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Control Panel\Desktop"))
+                using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(@"Control Panel\Desktop"))
                 {
                     if (key != null)
                     {
-                        string path = key.GetValue("WallPaper") as string;
+                        string? path = key.GetValue("WallPaper") as string;
                         if (!string.IsNullOrEmpty(path))
                             return path;
                     }
